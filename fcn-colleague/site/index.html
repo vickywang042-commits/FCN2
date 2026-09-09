@@ -694,47 +694,37 @@ async function encodeBackupCode(text) {
   const payload = bytesToBase64(new TextEncoder().encode(text));
   return `FCNRAW2:${payload.length}:${backupChecksum(payload)}:${payload}`;
 }
-function splitBackupCode(code, chunkSize = 1200) {
-  const cleanCode = String(code || "");
-  if (!cleanCode) throw new Error("BACKUP_CODE_EMPTY");
-  const transferId = backupChecksum(cleanCode);
-  const total = Math.ceil(cleanCode.length / chunkSize);
-  return Array.from({ length: total }, (_, index) => {
-    const payload = cleanCode.slice(index * chunkSize, (index + 1) * chunkSize);
-    return `FCNCHUNK1:${transferId}:${index + 1}/${total}:${payload.length}:${backupChecksum(payload)}:${payload}`;
+function backupPdfText(portableCode) {
+  const content = "BT\n/F1 20 Tf\n72 740 Td\n(FCN Backup) Tj\nET\n";
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${content.length} >>\nstream\n${content}endstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((body, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${body}\nendobj\n`;
   });
+  const wrappedBackup = portableCode.match(/.{1,96}/g).map((line) => `%${line}\n`).join("");
+  pdf += `%FCN-BACKUP-DATA\n${wrappedBackup}`;
+  const xrefOffset = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index <= objects.length; index += 1) pdf += `${String(offsets[index]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return pdf;
 }
-function parseBackupChunk(text) {
-  const clean = String(text || "").replace(/^\uFEFF/, "").trim();
-  const chunkIndex = clean.toUpperCase().indexOf("FCNCHUNK1:");
-  if (chunkIndex < 0) return null;
-  const compact = clean.slice(chunkIndex).replace(/[\s\u200B-\u200D\uFEFF]+/g, "");
-  const match = compact.match(/^FCNCHUNK1:([0-9a-f]{8}):(\d+)\/(\d+):(\d+):([0-9a-f]{8}):([A-Za-z0-9+/=:]+)/i);
-  if (!match) throw new Error("BACKUP_CHUNK_INCOMPLETE");
-  const index = Number(match[2]);
-  const total = Number(match[3]);
-  const expectedLength = Number(match[4]);
-  const payload = match[6].slice(0, expectedLength);
-  if (!index || !total || index > total || payload.length !== expectedLength || backupChecksum(payload) !== match[5].toLowerCase()) {
-    throw new Error("BACKUP_CHUNK_INCOMPLETE");
-  }
-  return { id: match[1].toLowerCase(), index, total, payload };
-}
-function mergeBackupChunks(session) {
-  if (!session?.id || !session?.total) throw new Error("BACKUP_CHUNKS_MISSING");
-  const code = Array.from({ length: session.total }, (_, index) => session.parts?.[index + 1]).join("");
-  if (!code || Object.keys(session.parts || {}).length !== session.total) throw new Error("BACKUP_CHUNKS_MISSING");
-  if (backupChecksum(code) !== session.id) throw new Error("BACKUP_CHUNK_INCOMPLETE");
-  return code;
-}
-function backupDocumentText(portableCode) {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>FCN Backup</title></head><body style="font-family:Arial,sans-serif"><h1>FCN Backup</h1><p>請勿編輯此文件。回到 FCN 追蹤台，按「匯入還原」並選擇本檔案。</p><pre style="white-space:pre-wrap;word-break:break-all">${portableCode}</pre></body></html>`;
+function backupWordText(portableCode) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>FCN Backup</title></head><body><h1>FCN Backup</h1><pre>${portableCode}</pre></body></html>`;
 }
 async function decodeBackupInput(text) {
   const clean = String(text || "").replace(/^\uFEFF/, "").trim();
   const raw2Index = clean.toUpperCase().indexOf("FCNRAW2:");
   if (raw2Index >= 0) {
-    const compact = clean.slice(raw2Index).replace(/[\s\u200B-\u200D\uFEFF]+/g, "");
+    const compact = clean.slice(raw2Index).replace(/[%\s\u200B-\u200D\uFEFF]+/g, "");
     const match = compact.match(/^FCNRAW2:(\d+):([0-9a-f]{8}):([A-Za-z0-9+/=]+)/i);
     if (!match) throw new Error("BACKUP_CODE_INCOMPLETE");
     const expectedLength = Number(match[1]);
@@ -753,35 +743,13 @@ async function decodeBackupInput(text) {
   return clean;
 }
 function backupImportErrorMessage(error, source = "備份") {
-  if (error?.message === "BACKUP_CODE_INCOMPLETE") return "備份碼不完整，請重新複製完整內容";
-  if (error?.message === "BACKUP_CHUNK_INCOMPLETE") return "這一段備份碼不完整，請從 LINE 重新複製整段";
-  if (error?.message === "BACKUP_CHUNK_MISMATCH") return "這一段屬於另一份備份，請先按「清除已收段落」";
-  if (error?.message === "BACKUP_CHUNKS_MISSING") return "尚有備份碼段落未貼入";
-  if (error?.message === "gzip unsupported") return "這是舊壓縮碼，請用新版重新產生備份碼";
+  if (error?.message === "BACKUP_CODE_INCOMPLETE") return "備份檔內容不完整，請重新下載或分享";
+  if (error?.message === "gzip unsupported") return "這是舊版備份，請由新版網站重新下載";
   if (error instanceof SyntaxError) return `${source}內容不是有效資料`;
   return `${source}格式不符或內容不完整`;
 }
 async function parseBackupInput(text) {
   return parseBackupText(await decodeBackupInput(text));
-}
-async function copyPlainText(text) {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch (_) {}
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.setAttribute("readonly", "");
-  textarea.style.position = "fixed";
-  textarea.style.opacity = "0";
-  document.body.appendChild(textarea);
-  textarea.select();
-  textarea.setSelectionRange(0, textarea.value.length);
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  return copied;
 }
 async function readBackupFile(file) {
   if (!file) throw new Error("missing file");
@@ -809,12 +777,6 @@ function App() {
   const [expiryMonth, setExpiryMonth] = useState(() => todayISO().slice(0, 7));
   const [koReportOpen, setKoReportOpen] = useState(false);
   const [koReportDate, setKoReportDate] = useState(() => todayISO());
-  const [backupCodeOpen, setBackupCodeOpen] = useState(false);
-  const [backupPasteText, setBackupPasteText] = useState("");
-  const [backupCodeBusy, setBackupCodeBusy] = useState(false);
-  const [backupShareChunks, setBackupShareChunks] = useState([]);
-  const [backupShareCopied, setBackupShareCopied] = useState(0);
-  const [backupReceived, setBackupReceived] = useState({ id: "", total: 0, parts: {} });
   const [installPrompt, setInstallPrompt] = useState(null);
   const [isInstalled, setIsInstalled] = useState(() => window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true);
   const fileInputRef = React.useRef(null);
@@ -848,7 +810,7 @@ function App() {
 
   const installOnDevice = async () => {
     if (!installPrompt) {
-      showToast("Android Chrome：右上角 ⋮ → 加到主畫面 → 安裝");
+      showToast("請開啟瀏覽器選單，選擇「加到主畫面」或「安裝應用程式」");
       return;
     }
     try {
@@ -954,24 +916,27 @@ function App() {
     setManualInputFor(null); setManualValue("");
   };
 
-  const exportBackup = async () => {
+  const backupFileFor = async (format) => {
+    const code = await encodeBackupCode(backupText(products, prices));
+    if (format === "word") return { text: backupWordText(code), name: `fcn-backup-${todayISO()}.doc`, type: "application/msword", label: "Word" };
+    return { text: backupPdfText(code), name: `fcn-backup-${todayISO()}.pdf`, type: "application/pdf", label: "PDF" };
+  };
+  const exportBackup = async (format) => {
     try {
-      const portableText = await encodeBackupCode(backupText(products, prices));
-      downloadTextFile(backupDocumentText(portableText), `fcn-backup-${todayISO()}.doc`, "application/msword;charset=utf-8");
-      showToast("Word 備份已下載");
+      const file = await backupFileFor(format);
+      downloadTextFile(file.text, file.name, file.type);
+      showToast(`${file.label} 備份已下載`);
     } catch (_) {
-      showToast("建立 Word 備份失敗");
+      showToast("建立備份失敗");
     }
   };
-  const shareBackup = async () => {
-    const name = `fcn-backup-${todayISO()}.doc`;
+  const shareBackup = async (format) => {
     try {
-      const code = await encodeBackupCode(backupText(products, prices));
-      const documentText = backupDocumentText(code);
-      if (await shareTextFile(documentText, name, "application/msword", "FCN追蹤台備份")) {
+      const file = await backupFileFor(format);
+      if (await shareTextFile(file.text, file.name, file.type, "FCN追蹤台備份")) {
         showToast("已開啟手機分享選單");
       } else {
-        downloadTextFile(documentText, name, "application/msword;charset=utf-8");
+        downloadTextFile(file.text, file.name, file.type);
         showToast("此瀏覽器不支援檔案分享，已改為下載備份");
       }
     } catch (error) {
@@ -988,69 +953,6 @@ function App() {
       showToast(backupImportErrorMessage(e, "備份檔"));
     }
   };
-  const copyBackupCode = async () => {
-    setBackupCodeBusy(true);
-    try {
-      let chunks = backupShareChunks;
-      if (!chunks.length) {
-        const code = await encodeBackupCode(backupText(products, prices));
-        chunks = splitBackupCode(code);
-        setBackupShareChunks(chunks);
-      }
-      if (backupShareCopied >= chunks.length) {
-        showToast("全部段落都已複製");
-        return;
-      }
-      const nextNumber = backupShareCopied + 1;
-      if (await copyPlainText(chunks[backupShareCopied])) {
-        setBackupShareCopied(nextNumber);
-        showToast(`已複製第 ${nextNumber}/${chunks.length} 段，請貼到 LINE`);
-      } else showToast("無法自動複製，請改用 Word 備份");
-    } catch (_) {
-      showToast("產生備份碼失敗，請改用 Word 備份");
-    } finally {
-      setBackupCodeBusy(false);
-    }
-  };
-  const importBackupCode = async () => {
-    if (!backupPasteText.trim()) return;
-    setBackupCodeBusy(true);
-    try {
-      const chunk = parseBackupChunk(backupPasteText);
-      if (chunk) {
-        if (backupReceived.id && (backupReceived.id !== chunk.id || backupReceived.total !== chunk.total)) {
-          throw new Error("BACKUP_CHUNK_MISMATCH");
-        }
-        const parts = { ...(backupReceived.parts || {}), [chunk.index]: chunk.payload };
-        const nextSession = { id: chunk.id, total: chunk.total, parts };
-        const receivedCount = Object.keys(parts).length;
-        setBackupReceived(nextSession);
-        setBackupPasteText("");
-        if (receivedCount < chunk.total) {
-          showToast(`已收到第 ${chunk.index}/${chunk.total} 段，還差 ${chunk.total - receivedCount} 段`);
-          return;
-        }
-        const data = await parseBackupInput(mergeBackupChunks(nextSession));
-        persistProducts(data.products);
-        persistPrices(data.prices);
-        setBackupReceived({ id: "", total: 0, parts: {} });
-        setBackupCodeOpen(false);
-        showToast(`全部段落已匯入：${data.products.length} 筆商品`);
-        return;
-      }
-      const data = await parseBackupInput(backupPasteText);
-      persistProducts(data.products);
-      persistPrices(data.prices);
-      setBackupPasteText("");
-      setBackupCodeOpen(false);
-      showToast(`備份碼已匯入：${data.products.length} 筆商品`);
-    } catch (error) {
-      showToast(backupImportErrorMessage(error, "備份碼"));
-    } finally {
-      setBackupCodeBusy(false);
-    }
-  };
-
   const statuses = useMemo(() => {
     const today = todayISO();
     return products.map((p) => ({ p, status: computeStatus(p, prices, today) }));
@@ -1171,14 +1073,17 @@ function App() {
             className="flex items-center gap-1.5 text-cyan-300 hover:text-cyan-200 text-sm font-medium">
             <IClock /> 每日新觸碰 KO
           </button>
-          <button onClick={exportBackup} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
+          <button onClick={() => exportBackup("pdf")} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
+            <IDownload /> 下載 PDF 備份
+          </button>
+          <button onClick={() => exportBackup("word")} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
             <IDownload /> 下載 Word 備份
           </button>
-          <button onClick={shareBackup} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
-            <IUpload /> 分享備份
+          <button onClick={() => shareBackup("pdf")} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
+            <IUpload /> 分享 PDF
           </button>
-          <button onClick={() => { setBackupShareChunks([]); setBackupShareCopied(0); setBackupPasteText(""); setBackupCodeOpen(true); }} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
-            <IInstall /> 備份碼傳輸
+          <button onClick={() => shareBackup("word")} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
+            <IUpload /> 分享 Word
           </button>
           <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
             <IUpload /> 匯入還原
@@ -1369,22 +1274,6 @@ function App() {
         />
       )}
 
-      {backupCodeOpen && (
-        <BackupCodeModal
-          value={backupPasteText}
-          onChange={setBackupPasteText}
-          onCopy={copyBackupCode}
-          onImport={importBackupCode}
-          busy={backupCodeBusy}
-          shareTotal={backupShareChunks.length}
-          shareCopied={backupShareCopied}
-          receivedSession={backupReceived}
-          onResetShare={() => { setBackupShareChunks([]); setBackupShareCopied(0); }}
-          onResetReceived={() => { setBackupReceived({ id: "", total: 0, parts: {} }); setBackupPasteText(""); }}
-          onClose={() => { setBackupCodeOpen(false); setBackupPasteText(""); }}
-        />
-      )}
-
       {manualInputFor && (
         <div className="fixed inset-0 bg-black/60 flex items-end sm:items-center justify-center z-50 p-4" onClick={() => setManualInputFor(null)}>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
@@ -1512,63 +1401,6 @@ function KoTouchReportModal({ date, onDateChange, rows, onExport, onShare, onClo
             className="py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium">
             <IUpload /> 直接分享
           </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function BackupCodeModal({ value, onChange, onCopy, onImport, busy, shareTotal, shareCopied, receivedSession, onResetShare, onResetReceived, onClose }) {
-  const receivedCount = Object.keys(receivedSession?.parts || {}).length;
-  const missingParts = receivedSession?.total
-    ? Array.from({ length: receivedSession.total }, (_, index) => index + 1).filter((part) => !receivedSession.parts?.[part])
-    : [];
-  return (
-    <div className="fixed inset-0 bg-black/70 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4" onClick={onClose}>
-      <div className="bg-slate-900 border border-slate-700 rounded-t-2xl sm:rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-slate-700">
-          <div>
-            <div className="font-display text-xl text-slate-50">備份碼傳輸</div>
-            <div className="text-xs text-slate-400 mt-1">不用下載或開啟檔案</div>
-          </div>
-          <button type="button" onClick={onClose} aria-label="關閉"><IX2 size={20} className="text-slate-300" /></button>
-        </div>
-        <div className="p-5 space-y-5">
-          <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-            <div className="text-slate-100 font-medium mb-1">原本有資料的裝置</div>
-            <div className="text-sm text-slate-400 leading-relaxed mb-3">系統會自動切成 LINE 不易截斷的短碼。每複製一段就貼到 LINE，再回來複製下一段。</div>
-            {shareTotal > 0 && (
-              <div className="flex items-center justify-between gap-3 mb-3 text-sm text-cyan-200">
-                <span>已複製 {shareCopied}/{shareTotal} 段</span>
-                <button type="button" onClick={onResetShare} className="text-slate-400 hover:text-slate-200">重新產生</button>
-              </div>
-            )}
-            <button type="button" disabled={busy || (shareTotal > 0 && shareCopied >= shareTotal)} onClick={onCopy}
-              className="w-full py-2.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium">
-              {busy ? "處理中…" : shareTotal === 0 ? "產生並複製第 1 段" : shareCopied < shareTotal ? `複製第 ${shareCopied + 1}/${shareTotal} 段` : "全部段落已複製"}
-            </button>
-          </section>
-          <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-            <div className="text-slate-100 font-medium mb-1">Android 手機</div>
-            <div className="text-sm text-slate-400 leading-relaxed mb-3">從 LINE 一次複製一整段，開頭、編號與內容都不要刪除。貼入後按「加入這一段」；順序不拘，收齊後會自動匯入。</div>
-            {receivedSession?.total > 0 && (
-              <div className="rounded-lg border border-amber-800 bg-amber-950/30 px-3 py-2 mb-3 text-sm">
-                <div className="flex items-center justify-between gap-3 text-amber-200">
-                  <span>已收到 {receivedCount}/{receivedSession.total} 段</span>
-                  <button type="button" onClick={onResetReceived} className="text-slate-300 hover:text-white">清除已收段落</button>
-                </div>
-                <div className="text-xs text-slate-400 mt-1">還缺：{missingParts.join("、")}</div>
-              </div>
-            )}
-            <textarea value={value} onChange={(e) => onChange(e.target.value)} rows="6" spellCheck="false"
-              placeholder="貼上以 FCNCHUNK1: 開頭的其中一段"
-              className="w-full resize-y rounded-xl border border-slate-600 bg-slate-950 px-3 py-3 text-sm text-slate-100 font-num placeholder:text-slate-500" />
-            <button type="button" disabled={busy || !value.trim()} onClick={onImport}
-              className="w-full mt-3 py-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-medium">
-              加入這一段
-            </button>
-          </section>
-          <div className="text-xs text-slate-400 leading-relaxed">匯入會以備份內容取代這個瀏覽器目前的商品與價格資料，建議先下載一份現有備份。</div>
         </div>
       </div>
     </div>
