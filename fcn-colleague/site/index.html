@@ -668,6 +668,62 @@ function parseBackupText(text) {
   }
   return { products: data.products, prices: data.prices };
 }
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 32768;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+async function encodeBackupCode(text) {
+  const bytes = new TextEncoder().encode(text);
+  if (typeof CompressionStream !== "undefined") {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+    const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+    return `FCNGZIP1:${bytesToBase64(compressed)}`;
+  }
+  return `FCNRAW1:${bytesToBase64(bytes)}`;
+}
+async function decodeBackupInput(text) {
+  const clean = String(text || "").replace(/^\uFEFF/, "").trim();
+  if (clean.startsWith("FCNGZIP1:")) {
+    if (typeof DecompressionStream === "undefined") throw new Error("gzip unsupported");
+    const bytes = base64ToBytes(clean.slice(9));
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return await new Response(stream).text();
+  }
+  if (clean.startsWith("FCNRAW1:")) return new TextDecoder().decode(base64ToBytes(clean.slice(8)));
+  return clean;
+}
+async function parseBackupInput(text) {
+  return parseBackupText(await decodeBackupInput(text));
+}
+async function copyPlainText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) {}
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  return copied;
+}
 async function readBackupFile(file) {
   if (!file) throw new Error("missing file");
   if (typeof file.text === "function") return await file.text();
@@ -694,6 +750,9 @@ function App() {
   const [expiryMonth, setExpiryMonth] = useState(() => todayISO().slice(0, 7));
   const [koReportOpen, setKoReportOpen] = useState(false);
   const [koReportDate, setKoReportDate] = useState(() => todayISO());
+  const [backupCodeOpen, setBackupCodeOpen] = useState(false);
+  const [backupPasteText, setBackupPasteText] = useState("");
+  const [backupCodeBusy, setBackupCodeBusy] = useState(false);
   const [installPrompt, setInstallPrompt] = useState(null);
   const [isInstalled, setIsInstalled] = useState(() => window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone === true);
   const fileInputRef = React.useRef(null);
@@ -834,17 +893,17 @@ function App() {
   };
 
   const exportBackup = () => {
-    downloadTextFile(backupText(products, prices), `fcn-backup-${todayISO()}.json`, "application/json;charset=utf-8");
-    showToast("備份已下載");
+    downloadTextFile(backupText(products, prices), `fcn-backup-${todayISO()}.txt`, "text/plain;charset=utf-8");
+    showToast("文字備份已下載");
   };
   const shareBackup = async () => {
-    const name = `fcn-backup-${todayISO()}.json`;
+    const name = `fcn-backup-${todayISO()}.txt`;
     const text = backupText(products, prices);
     try {
-      if (await shareTextFile(text, name, "application/json", "FCN追蹤台備份")) {
+      if (await shareTextFile(text, name, "text/plain", "FCN追蹤台備份")) {
         showToast("已開啟手機分享選單");
       } else {
-        downloadTextFile(text, name, "application/json;charset=utf-8");
+        downloadTextFile(text, name, "text/plain;charset=utf-8");
         showToast("此瀏覽器不支援檔案分享，已改為下載備份");
       }
     } catch (error) {
@@ -853,12 +912,40 @@ function App() {
   };
   const importBackup = async (file) => {
     try {
-      const data = parseBackupText(await readBackupFile(file));
+      const data = await parseBackupInput(await readBackupFile(file));
       persistProducts(data.products);
       persistPrices(data.prices);
       showToast(`備份已匯入：${data.products.length} 筆商品`);
     } catch (e) {
       showToast("不是有效的 FCN 備份檔，匯入失敗");
+    }
+  };
+  const copyBackupCode = async () => {
+    setBackupCodeBusy(true);
+    try {
+      const code = await encodeBackupCode(backupText(products, prices));
+      if (await copyPlainText(code)) showToast("備份碼已複製，可貼到 LINE");
+      else showToast("無法自動複製，請使用文字檔分享");
+    } catch (_) {
+      showToast("產生備份碼失敗，請使用文字檔分享");
+    } finally {
+      setBackupCodeBusy(false);
+    }
+  };
+  const importBackupCode = async () => {
+    if (!backupPasteText.trim()) return;
+    setBackupCodeBusy(true);
+    try {
+      const data = await parseBackupInput(backupPasteText);
+      persistProducts(data.products);
+      persistPrices(data.prices);
+      setBackupPasteText("");
+      setBackupCodeOpen(false);
+      showToast(`備份碼已匯入：${data.products.length} 筆商品`);
+    } catch (_) {
+      showToast("備份碼不完整或格式錯誤");
+    } finally {
+      setBackupCodeBusy(false);
     }
   };
 
@@ -987,6 +1074,9 @@ function App() {
           </button>
           <button onClick={shareBackup} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
             <IUpload /> 分享備份
+          </button>
+          <button onClick={() => setBackupCodeOpen(true)} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
+            <IInstall /> 備份碼傳輸
           </button>
           <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
             <IUpload /> 匯入還原
@@ -1177,6 +1267,17 @@ function App() {
         />
       )}
 
+      {backupCodeOpen && (
+        <BackupCodeModal
+          value={backupPasteText}
+          onChange={setBackupPasteText}
+          onCopy={copyBackupCode}
+          onImport={importBackupCode}
+          busy={backupCodeBusy}
+          onClose={() => { setBackupCodeOpen(false); setBackupPasteText(""); }}
+        />
+      )}
+
       {manualInputFor && (
         <div className="fixed inset-0 bg-black/60 flex items-end sm:items-center justify-center z-50 p-4" onClick={() => setManualInputFor(null)}>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
@@ -1304,6 +1405,44 @@ function KoTouchReportModal({ date, onDateChange, rows, onExport, onShare, onClo
             className="py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium">
             <IUpload /> 直接分享
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupCodeModal({ value, onChange, onCopy, onImport, busy, onClose }) {
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-end sm:items-center justify-center z-50 p-0 sm:p-4" onClick={onClose}>
+      <div className="bg-slate-900 border border-slate-700 rounded-t-2xl sm:rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-slate-700">
+          <div>
+            <div className="font-display text-xl text-slate-50">備份碼傳輸</div>
+            <div className="text-xs text-slate-400 mt-1">不用下載或開啟檔案</div>
+          </div>
+          <button type="button" onClick={onClose} aria-label="關閉"><IX2 size={20} className="text-slate-300" /></button>
+        </div>
+        <div className="p-5 space-y-5">
+          <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+            <div className="text-slate-100 font-medium mb-1">原本有資料的裝置</div>
+            <div className="text-sm text-slate-400 leading-relaxed mb-3">按下後會複製壓縮備份碼，再貼到 LINE 傳給 Android。</div>
+            <button type="button" disabled={busy} onClick={onCopy}
+              className="w-full py-2.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium">
+              {busy ? "處理中…" : "複製備份碼"}
+            </button>
+          </section>
+          <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+            <div className="text-slate-100 font-medium mb-1">Android 手機</div>
+            <div className="text-sm text-slate-400 leading-relaxed mb-3">長按下方欄位，貼上 LINE 收到的完整備份碼。</div>
+            <textarea value={value} onChange={(e) => onChange(e.target.value)} rows="6" spellCheck="false"
+              placeholder="貼上以 FCNGZIP1: 或 FCNRAW1: 開頭的備份碼"
+              className="w-full resize-y rounded-xl border border-slate-600 bg-slate-950 px-3 py-3 text-sm text-slate-100 font-num placeholder:text-slate-500" />
+            <button type="button" disabled={busy || !value.trim()} onClick={onImport}
+              className="w-full mt-3 py-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-medium">
+              匯入備份碼
+            </button>
+          </section>
+          <div className="text-xs text-slate-400 leading-relaxed">匯入會以備份內容取代這個瀏覽器目前的商品與價格資料，建議先下載一份現有備份。</div>
         </div>
       </div>
     </div>
