@@ -682,17 +682,34 @@ function base64ToBytes(value) {
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
 }
-async function encodeBackupCode(text) {
-  const bytes = new TextEncoder().encode(text);
-  if (typeof CompressionStream !== "undefined") {
-    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
-    const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
-    return `FCNGZIP1:${bytesToBase64(compressed)}`;
+function backupChecksum(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
   }
-  return `FCNRAW1:${bytesToBase64(bytes)}`;
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+async function encodeBackupCode(text) {
+  const payload = bytesToBase64(new TextEncoder().encode(text));
+  return `FCNRAW2:${payload.length}:${backupChecksum(payload)}:${payload}`;
+}
+function backupDocumentText(portableCode) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>FCN Backup</title></head><body style="font-family:Arial,sans-serif"><h1>FCN Backup</h1><p>請勿編輯此文件。回到 FCN 追蹤台，按「匯入還原」並選擇本檔案。</p><pre style="white-space:pre-wrap;word-break:break-all">${portableCode}</pre></body></html>`;
 }
 async function decodeBackupInput(text) {
   const clean = String(text || "").replace(/^\uFEFF/, "").trim();
+  const raw2Index = clean.toUpperCase().indexOf("FCNRAW2:");
+  if (raw2Index >= 0) {
+    const compact = clean.slice(raw2Index).replace(/[\s\u200B-\u200D\uFEFF]+/g, "");
+    const match = compact.match(/^FCNRAW2:(\d+):([0-9a-f]{8}):([A-Za-z0-9+/=]+)/i);
+    if (!match) throw new Error("BACKUP_CODE_INCOMPLETE");
+    const expectedLength = Number(match[1]);
+    const expectedChecksum = match[2].toLowerCase();
+    const payload = match[3].slice(0, expectedLength);
+    if (payload.length !== expectedLength || backupChecksum(payload) !== expectedChecksum) throw new Error("BACKUP_CODE_INCOMPLETE");
+    return new TextDecoder().decode(base64ToBytes(payload));
+  }
   if (clean.startsWith("FCNGZIP1:")) {
     if (typeof DecompressionStream === "undefined") throw new Error("gzip unsupported");
     const bytes = base64ToBytes(clean.slice(9));
@@ -701,6 +718,12 @@ async function decodeBackupInput(text) {
   }
   if (clean.startsWith("FCNRAW1:")) return new TextDecoder().decode(base64ToBytes(clean.slice(8)));
   return clean;
+}
+function backupImportErrorMessage(error, source = "備份") {
+  if (error?.message === "BACKUP_CODE_INCOMPLETE") return "備份碼不完整，請重新複製完整內容";
+  if (error?.message === "gzip unsupported") return "這是舊壓縮碼，請用新版重新產生備份碼";
+  if (error instanceof SyntaxError) return `${source}內容不是有效資料`;
+  return `${source}格式不符或內容不完整`;
 }
 async function parseBackupInput(text) {
   return parseBackupText(await decodeBackupInput(text));
@@ -892,22 +915,28 @@ function App() {
     setManualInputFor(null); setManualValue("");
   };
 
-  const exportBackup = () => {
-    downloadTextFile(backupText(products, prices), `fcn-backup-${todayISO()}.txt`, "text/plain;charset=utf-8");
-    showToast("文字備份已下載");
+  const exportBackup = async () => {
+    try {
+      const portableText = await encodeBackupCode(backupText(products, prices));
+      downloadTextFile(backupDocumentText(portableText), `fcn-backup-${todayISO()}.doc`, "application/msword;charset=utf-8");
+      showToast("Word 備份已下載");
+    } catch (_) {
+      showToast("建立 Word 備份失敗");
+    }
   };
   const shareBackup = async () => {
-    const name = `fcn-backup-${todayISO()}.txt`;
-    const text = backupText(products, prices);
+    const name = `fcn-backup-${todayISO()}.doc`;
     try {
-      if (await shareTextFile(text, name, "text/plain", "FCN追蹤台備份")) {
+      const code = await encodeBackupCode(backupText(products, prices));
+      const documentText = backupDocumentText(code);
+      if (await shareTextFile(documentText, name, "application/msword", "FCN追蹤台備份")) {
         showToast("已開啟手機分享選單");
       } else {
-        downloadTextFile(text, name, "text/plain;charset=utf-8");
+        downloadTextFile(documentText, name, "application/msword;charset=utf-8");
         showToast("此瀏覽器不支援檔案分享，已改為下載備份");
       }
     } catch (error) {
-      if (error?.name !== "AbortError") showToast("分享失敗，請改用匯出備份");
+      if (error?.name !== "AbortError") showToast("分享失敗，請改用下載備份");
     }
   };
   const importBackup = async (file) => {
@@ -917,7 +946,7 @@ function App() {
       persistPrices(data.prices);
       showToast(`備份已匯入：${data.products.length} 筆商品`);
     } catch (e) {
-      showToast("不是有效的 FCN 備份檔，匯入失敗");
+      showToast(backupImportErrorMessage(e, "備份檔"));
     }
   };
   const copyBackupCode = async () => {
@@ -942,8 +971,8 @@ function App() {
       setBackupPasteText("");
       setBackupCodeOpen(false);
       showToast(`備份碼已匯入：${data.products.length} 筆商品`);
-    } catch (_) {
-      showToast("備份碼不完整或格式錯誤");
+    } catch (error) {
+      showToast(backupImportErrorMessage(error, "備份碼"));
     } finally {
       setBackupCodeBusy(false);
     }
@@ -1070,7 +1099,7 @@ function App() {
             <IClock /> 每日新觸碰 KO
           </button>
           <button onClick={exportBackup} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
-            <IDownload /> 下載備份
+            <IDownload /> 下載 Word 備份
           </button>
           <button onClick={shareBackup} className="flex items-center gap-1.5 text-slate-400 hover:text-slate-200 text-sm">
             <IUpload /> 分享備份
@@ -1425,7 +1454,7 @@ function BackupCodeModal({ value, onChange, onCopy, onImport, busy, onClose }) {
         <div className="p-5 space-y-5">
           <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
             <div className="text-slate-100 font-medium mb-1">原本有資料的裝置</div>
-            <div className="text-sm text-slate-400 leading-relaxed mb-3">按下後會複製壓縮備份碼，再貼到 LINE 傳給 Android。</div>
+            <div className="text-sm text-slate-400 leading-relaxed mb-3">按下後會複製相容三星手機的純文字備份碼，再貼到 LINE 傳給 Android。</div>
             <button type="button" disabled={busy} onClick={onCopy}
               className="w-full py-2.5 rounded-lg bg-cyan-700 hover:bg-cyan-600 disabled:bg-slate-800 disabled:text-slate-500 text-white font-medium">
               {busy ? "處理中…" : "複製備份碼"}
@@ -1435,7 +1464,7 @@ function BackupCodeModal({ value, onChange, onCopy, onImport, busy, onClose }) {
             <div className="text-slate-100 font-medium mb-1">Android 手機</div>
             <div className="text-sm text-slate-400 leading-relaxed mb-3">長按下方欄位，貼上 LINE 收到的完整備份碼。</div>
             <textarea value={value} onChange={(e) => onChange(e.target.value)} rows="6" spellCheck="false"
-              placeholder="貼上以 FCNGZIP1: 或 FCNRAW1: 開頭的備份碼"
+              placeholder="貼上以 FCNRAW2: 開頭的完整備份碼"
               className="w-full resize-y rounded-xl border border-slate-600 bg-slate-950 px-3 py-3 text-sm text-slate-100 font-num placeholder:text-slate-500" />
             <button type="button" disabled={busy || !value.trim()} onClick={onImport}
               className="w-full mt-3 py-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 text-slate-950 font-medium">
