@@ -358,6 +358,10 @@ function isAutoCallable(p) { return isDailyStructure(p) || isStepdown(p); }
 function fcnModeOf(p) { return p.fcnMode || "daily"; }
 function stepdownModeOf(p) { return p.stepdownMode || "period_end"; }
 function kiTypeOf(p) {
+  // Older Stepdown records never exposed a KI selector. Treat those records as
+  // None until the user explicitly chooses EKI/AKI, instead of silently using
+  // the old hidden EKI default.
+  if (isStepdown(p) && p.kiTypeConfigured !== true) return "NONE";
   const type = String(p.kiType || "").toUpperCase();
   if (["EKI", "AKI", "NONE"].includes(type)) return type;
   return p.hasKi === false ? "NONE" : "EKI";
@@ -419,7 +423,9 @@ function dailyKoProgress(p, prices, today = todayISO()) {
 }
 function stepdownKoProgress(p, prices, today = todayISO()) {
   const underlyings = p.underlyings || [];
-  const observed = observationSchedule(p).filter((obs) => obs.date && obs.date <= today && obs.date < maturityOf(p));
+  // The final valuation date is also the last Stepdown KO observation. KO is
+  // evaluated first there; KI/None is only used when that KO check fails.
+  const observed = observationSchedule(p).filter((obs) => obs.date && obs.date <= today && obs.date <= maturityOf(p));
   const checks = observed.map((obs) => {
     const results = underlyings.map((u) => {
       const close = trustedCloseForDate(historyFor(u.symbol, prices)[obs.date], obs.date, u.symbol);
@@ -471,7 +477,7 @@ function maturityOutcome(p, prices) {
   const strikePct = Number(p.strikePct) || 0;
   const kiPct = Number(p.kiPct) || 0;
   const finalBelow = (boundaryPct) => underlyings.some((u, index) => finalPrices[index] < (Number(u.entryPrice) || 0) * boundaryPct / 100);
-  if (isStepdown(p) || kiType === "NONE") return { ready: true, shares: finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType: isStepdown(p) ? "NONE" : kiType };
+  if (kiType === "NONE") return { ready: true, shares: finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType };
   if (kiType === "EKI") return { ready: true, shares: finalBelow(kiPct), boundaryPct: kiPct, finalPrices, kiType };
   const aki = akiProgress(p, prices);
   return { ready: true, shares: aki.triggered && finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType, aki };
@@ -499,7 +505,7 @@ function computeStatus(p, prices, today = todayISO()) {
 
   const progress = koProgressFor(p, prices, today);
   const scheduledObservationToday = isStepdown(p)
-    && observationSchedule(p).some((observation) => observation.date === today && observation.date < maturity);
+    && observationSchedule(p).some((observation) => observation.date === today && observation.date <= maturity);
   if (scheduledObservationToday && !productMarketsCloseReady(p, today, today)) {
     return { key: "live", label: "等待市場收盤", tone: "warning", koProgress: progress, daysToMaturity: daysBetween(today, maturity), waitingForClose: true };
   }
@@ -552,7 +558,7 @@ const emptyProduct = () => ({
   clients: [emptyClient()],
   tradeDate: todayISO(),
   tenorMonths: 6, guaranteedCouponMonths: 1, startObsDate: "", finalValuationDate: "",
-  couponRate: "", strikePct: 100, autocallPct: 100, stepDownPct: 5, hasKi: true, kiType: "EKI", kiPct: 70,
+  couponRate: "", strikePct: 100, autocallPct: 100, stepDownPct: 5, hasKi: true, kiType: "EKI", kiTypeConfigured: true, kiPct: 70,
   firstMonthObsEnd: "", observationDates: Array.from({ length: 6 }, () => ({ id: uid(), date: "" })),
   underlyings: [emptyUnderlying()], notes: "",
 });
@@ -578,7 +584,7 @@ function firstKoTouchForUnderlying(p, u, prices, asOfDate = todayISO()) {
   const hist = historyFor(u.symbol, prices);
   if (isStepdown(p)) {
     const observations = observationSchedule(p)
-      .filter((obs) => obs.date && obs.date <= asOfDate && obs.date < maturityOf(p))
+      .filter((obs) => obs.date && obs.date <= asOfDate && obs.date <= maturityOf(p))
       .sort((a, b) => a.date.localeCompare(b.date) || a.index - b.index);
     for (const obs of observations) {
       const close = trustedCloseForDate(hist[obs.date], obs.date, u.symbol);
@@ -1157,7 +1163,7 @@ function App() {
                     <Field label="保證領息" value={`${guaranteedCouponMonthsOf(p)} 個月`} />
                     <Field label="執行價" value={`${p.strikePct}%`} />
                     <Field label="出場價" value={`${p.autocallPct}%`} />
-                    <Field label="期末判斷" value={isStepdown(p) ? `執行價 ${p.strikePct}%` : kiTypeOf(p) === "NONE" ? "None" : `${kiTypeOf(p)} ${p.kiPct}%`} />
+                    <Field label="期末判斷" value={kiTypeOf(p) === "NONE" ? `None／執行價 ${p.strikePct}%` : `${kiTypeOf(p)} ${p.kiPct}%`} />
                     {isStepdown(p) && <Field label="每月步階下降" value={`${p.stepDownPct || 0}%`} />}
                     {structureOf(p) === "EXPRESS_FCN" && <Field label="首月觀察結束" value={p.firstMonthObsEnd ? fmtDate(p.firstMonthObsEnd) : "—"} />}
                   </div>
@@ -1192,7 +1198,7 @@ function App() {
                         const ratio = lp ? (lp.price / Number(u.entryPrice)) * 100 : null;
                         const lv = levelsFor(p, u);
                         const koHit = status.koProgress?.hits?.[underlyingIndex] || (isDailyStructure(p) ? koHitForUnderlying(p, u, prices) : null);
-                        const akiHit = !isStepdown(p) && kiTypeOf(p) === "AKI" ? akiHitForUnderlying(p, u, prices) : null;
+                        const akiHit = kiTypeOf(p) === "AKI" ? akiHitForUnderlying(p, u, prices) : null;
                         return (
                           <div key={u.id} className="bg-slate-950 rounded-xl px-4 py-3 border border-slate-800">
                             <div className="flex items-center justify-between">
@@ -1223,7 +1229,7 @@ function App() {
                             <div className="flex flex-wrap gap-x-5 gap-y-1 mt-2 pt-2 border-t border-slate-700 text-sm font-num text-slate-400">
                               <span>初始KO價 <span className="text-slate-100">{lv.ko.toFixed(2)}</span></span>
                               <span>執行價 <span className="text-slate-100">{lv.strike.toFixed(2)}</span></span>
-                              {!isStepdown(p) && kiTypeOf(p) !== "NONE" && <span>{kiTypeOf(p)}價 <span className="text-slate-100">{lv.ki.toFixed(2)}</span></span>}
+                              {kiTypeOf(p) !== "NONE" && <span>{kiTypeOf(p)}價 <span className="text-slate-100">{lv.ki.toFixed(2)}</span></span>}
                             </div>
                           </div>
                         );
@@ -1232,7 +1238,7 @@ function App() {
                   </div>
 
                   <div className="text-sm text-slate-400 mb-4 bg-slate-950 rounded-lg px-3 py-2 leading-relaxed">
-                    收盤時間依連結標的市場判斷，與商品幣別無關。{isStepdown(p) ? " Stepdown 期末看執行價。" : kiTypeOf(p) === "EKI" ? " EKI 只看期末比價日。" : kiTypeOf(p) === "AKI" ? " AKI 監測交易日至期末比價日。" : " None 期末看執行價。"}
+                    收盤時間依連結標的市場判斷，與商品幣別無關。{isStepdown(p) && " Stepdown 期末先看 KO，未達才看 KI。"}{kiTypeOf(p) === "EKI" ? " EKI 只看期末比價日。" : kiTypeOf(p) === "AKI" ? " AKI 監測交易日至期末比價日。" : " None 期末看執行價。"}
                   </div>
 
                   {p.notes && <div className="text-xs text-slate-500 mb-3">備註：{p.notes}</div>}
@@ -1564,10 +1570,10 @@ function ProductForm({ product, onCancel, onSave }) {
             </div>
           )}
 
-          {!isStepdown(p) && <>
+          <>
             <label className="block">
               <div className="text-sm text-slate-400 mb-1">KI 類型</div>
-              <select value={kiTypeOf(p)} onChange={(e) => setP((prev) => ({ ...prev, kiType: e.target.value, hasKi: e.target.value !== "NONE" }))}
+              <select value={kiTypeOf(p)} onChange={(e) => setP((prev) => ({ ...prev, kiType: e.target.value, kiTypeConfigured: true, hasKi: e.target.value !== "NONE" }))}
                 className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 text-sm">
                 <option value="EKI">EKI</option>
                 <option value="AKI">AKI</option>
@@ -1575,7 +1581,7 @@ function ProductForm({ product, onCancel, onSave }) {
               </select>
             </label>
             {kiTypeOf(p) !== "NONE" && <TextInput label={`${kiTypeOf(p)} %`} type="number" value={p.kiPct} onChange={(v) => update("kiPct", v)} />}
-          </>}
+          </>
 
           <div>
             <div className="flex items-center justify-between mb-2">
