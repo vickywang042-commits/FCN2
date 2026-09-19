@@ -316,7 +316,6 @@ function trustedCloseForDate(value, date, symbol = "") {
   const isObject = typeof value === "object" && value !== null;
   if (isObject && value.manualClose === true) return close;
   if (isObject && value.officialClose === true) {
-    if (date < "2026-09-08") return close;
     return value.closeVerification === "completed-daily-v3" ? close : null;
   }
   if (age >= 0 && age <= 2) return null;
@@ -391,7 +390,7 @@ function koHitForUnderlying(p, u, prices, today = todayISO()) {
   const start = trackingStartOf(p);
   const hist = historyFor(u.symbol, prices);
   const maturity = maturityOf(p);
-  const dates = Object.keys(hist).filter((date) => date >= start && date <= today && date < maturity).sort();
+  const dates = Object.keys(hist).filter((date) => date >= start && date <= today && date <= maturity).sort();
   if (fcnModeOf(p) === "daily_memory") {
     // Daily Memory locks in each underlying only when that day's official
     // closing price reaches KO; do not use the intraday high.
@@ -413,7 +412,7 @@ function dailyKoProgress(p, prices, today = todayISO()) {
     return { complete, hitCount: hits.filter((hit) => hit.hit).length, total: hits.length, date: complete ? hits.map((hit) => hit.date).sort().at(-1) : null, hits };
   }
   const maturity = maturityOf(p);
-  const commonDates = Object.keys(historyFor(underlyings[0]?.symbol, prices) || {}).filter((date) => date >= start && date <= today && date < maturity).sort();
+  const commonDates = Object.keys(historyFor(underlyings[0]?.symbol, prices) || {}).filter((date) => date >= start && date <= today && date <= maturity).sort();
   const date = commonDates.find((candidate) => underlyings.every((u) => {
     const record = historyFor(u.symbol, prices)[candidate];
     return record && (trustedCloseForDate(record, candidate, u.symbol) || 0) >= levelsFor(p, u).ko;
@@ -478,7 +477,10 @@ function maturityOutcome(p, prices) {
   const kiPct = Number(p.kiPct) || 0;
   const finalBelow = (boundaryPct) => underlyings.some((u, index) => finalPrices[index] < (Number(u.entryPrice) || 0) * boundaryPct / 100);
   if (kiType === "NONE") return { ready: true, shares: finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType };
-  if (kiType === "EKI") return { ready: true, shares: finalBelow(kiPct), boundaryPct: kiPct, finalPrices, kiType };
+  if (kiType === "EKI") {
+    const kiTriggered = finalBelow(kiPct);
+    return { ready: true, shares: kiTriggered && finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType, kiTriggered };
+  }
   const aki = akiProgress(p, prices);
   return { ready: true, shares: aki.triggered && finalBelow(strikePct), boundaryPct: strikePct, finalPrices, kiType, aki };
 }
@@ -599,7 +601,7 @@ function firstKoTouchForUnderlying(p, u, prices, asOfDate = todayISO()) {
   const koPrice = entryPrice * koPct / 100;
   const start = trackingStartOf(p);
   const dates = Object.keys(hist)
-    .filter((date) => date >= start && date <= asOfDate && date < maturityOf(p))
+    .filter((date) => date >= start && date <= asOfDate && date <= maturityOf(p))
     .sort();
   for (const date of dates) {
     const close = trustedCloseForDate(hist[date], date, u.symbol);
@@ -1238,7 +1240,7 @@ function App() {
                   </div>
 
                   <div className="text-sm text-slate-400 mb-4 bg-slate-950 rounded-lg px-3 py-2 leading-relaxed">
-                    收盤時間依連結標的市場判斷，與商品幣別無關。{isStepdown(p) && " Stepdown 期末先看 KO，未達才看 KI。"}{kiTypeOf(p) === "EKI" ? " EKI 只看期末比價日。" : kiTypeOf(p) === "AKI" ? " AKI 監測交易日至期末比價日。" : " None 期末看執行價。"}
+                    期末先 KO，再 KI，最後執行價。收盤時間依連結標的市場，與幣別無關。{kiTypeOf(p) === "EKI" ? " EKI 期末觀察。" : kiTypeOf(p) === "AKI" ? " AKI 從交易日至期末監測。" : ""}
                   </div>
 
                   {p.notes && <div className="text-xs text-slate-500 mb-3">備註：{p.notes}</div>}
