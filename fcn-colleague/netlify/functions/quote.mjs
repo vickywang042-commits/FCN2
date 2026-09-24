@@ -105,8 +105,18 @@ export default async (request) => {
   const validStart = /^\d{4}-\d{2}-\d{2}$/.test(start || "") ? start : null;
 
   try {
-    const periodParams = validStart
-      ? `period1=${Math.floor(Date.parse(`${validStart}T00:00:00Z`) / 1000)}&period2=${Math.floor(Date.now() / 1000) + 86400}`
+    // The observation start controls KO checks in the browser, but it must not
+    // hide the latest completed close. A product can be entered before its
+    // observation period begins, so always fetch a short lookback before the
+    // earlier of the observation start and today. The browser still filters KO
+    // history from the exact observation date entered by the user.
+    const nowMilliseconds = Date.now();
+    const requestedStartMilliseconds = validStart ? Date.parse(`${validStart}T00:00:00Z`) : null;
+    const historyStartMilliseconds = Number.isFinite(requestedStartMilliseconds)
+      ? Math.max(0, Math.min(requestedStartMilliseconds, nowMilliseconds) - 14 * 86400000)
+      : null;
+    const periodParams = historyStartMilliseconds !== null
+      ? `period1=${Math.floor(historyStartMilliseconds / 1000)}&period2=${Math.floor(nowMilliseconds / 1000) + 86400}`
       : "range=5d";
     const data = await fetchYahooChart(symbol, `${periodParams}&interval=1d&includePrePost=false`);
     const result = data?.chart?.result?.[0];
